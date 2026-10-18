@@ -1,0 +1,536 @@
+diff --git a/premake5.lua b/premake5.lua
+index cd3fab5..4c96eb6 100644
+--- a/premake5.lua
++++ b/premake5.lua
+@@ -167,11 +167,15 @@ project "th06"
+     end
+   filter {}
+ 
++  -- Mod: Windows 下用 MinGW (gmake2) 构建时没有 pkg-config。
++  -- SDL2 的头文件与库已合并进 MinGW 的 sysroot，这里只需产生 -l 链接标志。
+   filter { "system:windows", "action:not vs*" }
+-    local pc_cflags = os.outputof("pkg-config --cflags sdl2 SDL2_image SDL2_ttf") or ""
+-    local pc_libs   = os.outputof("pkg-config --libs   sdl2 SDL2_image SDL2_ttf") or ""
+-    if #pc_cflags > 0 then buildoptions { pc_cflags } end
+-    if #pc_libs   > 0 then linkoptions  { pc_libs }   end
++    links { "SDL2", "SDL2_image", "SDL2_ttf" }
++    -- GUI 子系统(-mwindows)需要 WinMain。libmingw32.a 会引用它，而 gcc 把
++    -- libmingw32.a 追加在所有用户库之后，所以 SDL2main 必须显式前置到它前面，
++    -- 即 SDL 官方要求的 "-lmingw32 -lSDL2main -lSDL2" 顺序，否则链接期报
++    -- undefined reference to `WinMain'。
++    linkoptions { "-lmingw32", "-lSDL2main" }
+   filter {}
+ 
+   filter "configurations:Debug"
+@@ -232,6 +236,8 @@ project "th06_config"
+ 
+   filter "system:windows"
+     links { "SDL2", "SDL2main", "SDL2_ttf" }
++  filter { "system:windows", "action:not vs*" }
++    linkoptions { "-lmingw32", "-lSDL2main" }
+   filter {}
+ 
+   filter "configurations:Debug"
+diff --git a/src/BulletManager.cpp b/src/BulletManager.cpp
+index ad78596..ba87f1c 100644
+--- a/src/BulletManager.cpp
++++ b/src/BulletManager.cpp
+@@ -14,6 +14,87 @@
+ #include "utils.hpp"
+ 
+ BulletManager g_BulletManager;
++
++/* --- Mod: 敌弹 -> 道具 ---
++ * g_BulletsToItems = 0 即完全恢复原版行为。
++ * 激光（SpawnLaserPattern）不在改动范围内，保持原样。
++ */
++i32 g_BulletsToItems = 1;
++ItemType g_BulletItemType = ITEM_POINT; // 得点道具；想要火力就改成 ITEM_POWER_SMALL
++f32 g_BulletItemSpread = 56.0f;         // 模式 0 用：沿着原本子弹该飞的方向炸开多远
++i32 g_BulletItemSample = 1;             // 道具池只有 513 个，弹幕太密时改成 2 或 3
++
++// 运动模式：
++//   0 = 炸开一小段后垂直掉落（Item 的 state 2，只还原方向、不计速度）
++//   1 = 沿原本弹道匀速直线飞行（Item 的自定义 state 3，还原真实速度矢量）
++// g_BulletItemSpeedScale 目前为 1.0，即与子弹完全同速；
++// 代价是道具会很快飞出屏幕、基本收不到（原速本来就是用来杀人的）。
++// 若想在「形状还原」和「能收集」之间折中，把它调到 0.4~0.7。
++i32 g_BulletItemMotionMode = 1;
++f32 g_BulletItemSpeedScale = 1.0f;
++static i32 g_BulletItemSampleCounter = 0;
++
++// 把一个本该生成的敌弹替换成道具，沿原弹道方向散开，避免整组道具重叠在发射点上。
++static i32 SpawnBulletAsItem(const EnemyBulletShooter *bulletProps, f32 bulletAngle, f32 bulletSpeed)
++{
++    ZunVec3 itemPosition;
++    ZunVec3 bulletOffset;
++    ZunVec3 itemTarget;
++
++    if (g_BulletItemSample > 1)
++    {
++        if ((g_BulletItemSampleCounter++ % g_BulletItemSample) != 0)
++        {
++            return 0;
++        }
++    }
++
++    itemPosition = bulletProps->position;
++    itemPosition.z = 0.0f;
++
++    if (g_BulletItemMotionMode != 0)
++    {
++        // 沿原本弹道飞行：速度矢量 = 这一发真实的方向 × 真实弹速 × 缩放系数。
++        ZunVec3 flightVelocity;
++        sincosmul(&flightVelocity, bulletAngle, bulletSpeed * g_BulletItemSpeedScale);
++        flightVelocity.z = 0.0f; // sincosmul 只写 x / y
++        g_ItemManager.SpawnItem(&itemPosition, g_BulletItemType, 3, &flightVelocity);
++        return 0;
++    }
++
++    sincosmul(&bulletOffset, bulletAngle, g_BulletItemSpread);
++    bulletOffset.z = 0.0f; // sincosmul 只写 x / y
++    itemTarget = itemPosition + bulletOffset;
++    itemTarget.z = 0.0f;
++
++    // GAME_REGION_* 是 double 字面量，统一收成 f32 避免窄化转换警告。
++    const f32 leftBound = (f32)GAME_REGION_LEFT + 8.0f;
++    const f32 rightBound = (f32)GAME_REGION_RIGHT - 8.0f;
++    const f32 topBound = (f32)GAME_REGION_TOP + 8.0f;
++    const f32 bottomBound = (f32)GAME_REGION_BOTTOM - 64.0f;
++
++    // 把落点夹在游戏区域内，否则道具会飘出屏幕后被回收。
++    if (itemTarget.x < leftBound)
++    {
++        itemTarget.x = leftBound;
++    }
++    if (itemTarget.x > rightBound)
++    {
++        itemTarget.x = rightBound;
++    }
++    if (itemTarget.y < topBound)
++    {
++        itemTarget.y = topBound;
++    }
++    if (itemTarget.y > bottomBound)
++    {
++        itemTarget.y = bottomBound;
++    }
++
++    g_ItemManager.SpawnItem(&itemPosition, g_BulletItemType, 2, &itemTarget);
++    return 0;
++}
++
+ static ChainElem g_BulletManagerCalcChain;
+ static ChainElem g_BulletManagerDrawChain;
+ static const u32 g_EffectsColorWithTextureBlending[28] = {
+@@ -165,6 +246,13 @@ u32 BulletManager::SpawnSingleBullet(const EnemyBulletShooter *bulletProps, i32
+         bulletSpeed = g_Rng.GetRandomF32InRange(bulletProps->speed1 - bulletProps->speed2) + bulletProps->speed2;
+     }
+ 
++    // Mod: 敌弹 -> 道具。bulletAngle 到这里已是这一发的真实方向，
++    // 且尚未写入 bullets[]，直接接管即可。激光走 SpawnLaserPattern，不受影响。
++    if (g_BulletsToItems != 0)
++    {
++        return SpawnBulletAsItem(bulletProps, bulletAngle, bulletSpeed);
++    }
++
+     bullet->state = 1;
+     bullet->unk_5c2 = 1;
+     bullet->speed = bulletSpeed;
+diff --git a/src/BulletManager.hpp b/src/BulletManager.hpp
+index 879fa25..de421b0 100644
+--- a/src/BulletManager.hpp
++++ b/src/BulletManager.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "AnmVm.hpp"
++#include "ItemManager.hpp"
+ #include "ZunResult.hpp"
+ #include "inttypes.hpp"
+ 
+@@ -115,3 +116,13 @@ struct BulletManager
+ 
+ extern const u32 *g_EffectsColor;
+ extern BulletManager g_BulletManager;
++
++/* --- Mod: 敌弹 -> 道具（激光不受影响） ---
++ * 全部在 BulletManager.cpp 顶部定义，改那一个文件即可调参。
++ */
++extern i32 g_BulletsToItems;      // 0 = 原版弹幕；非 0 = 敌弹改为生成道具
++extern ItemType g_BulletItemType; // 生成哪种道具
++extern f32 g_BulletItemSpread;    // 模式 0：沿着原弹道炸开的距离（像素）
++extern i32 g_BulletItemSample;    // 1 = 每发都变；N = 每 N 发才变一个（道具池只有 513 个）
++extern i32 g_BulletItemMotionMode; // 0 = 炸开后掉落；1 = 沿原弹道匀速飞行
++extern f32 g_BulletItemSpeedScale; // 模式 1：飞行速度相对原弹速的缩放（原速会快到追不上）
+diff --git a/src/Config/config.cpp b/src/Config/config.cpp
+index 8ec2a3f..93a90b3 100644
+--- a/src/Config/config.cpp
++++ b/src/Config/config.cpp
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "../Supervisor.hpp"
++#include "../i18n.hpp"
+ #include "../inttypes.hpp"
+ #include "Widgets.hpp"
+ 
+@@ -18,51 +19,61 @@ constexpr SDL_Color kBackgroundColor{43, 43, 43, 255};
+ 
+ namespace FileSystem
+ {
+-unsigned char *OpenPath(const char *filepath)
++// 注意：这里**不能用 fopen**。configPath 是 "東方紅魔郷.cfg"，源码以 UTF-8 存储，
++// 而 MinGW CRT 的 fopen 会把路径当作当前 ANSI 代码页（中文 Windows = CP936/GBK）解析，
++// 导致文件名变形、fopen 直接失败（表現为「无法写入配置文件」）。
++// 主游戏之所以没事，是因为它用的是项目自带的 FileSystem::FopenUTF8()（内部 UTF-8 -> UTF-16 -> _wfopen）。
++// config 是独立小工具，为免把 FileSystem.cpp 及其依赖链拉进来，
++// 这里改用 SDL_RWops：SDL 在 Windows 上同样把 UTF-8 转成 UTF-16 再调 CreateFileW，且跨平台行为一致。
++unsigned char *OpenPath(const char *filepath, size_t *outSize)
+ {
+-    FILE *file = fopen(filepath, "rb");
+-    if (!file)
++    SDL_RWops *rw = SDL_RWFromFile(filepath, "rb");
++    if (!rw)
+     {
+         return nullptr;
+     }
+ 
+-    fseek(file, 0, SEEK_END);
+-    const size_t size = ftell(file);
+-    fseek(file, 0, SEEK_SET);
++    const Sint64 size64 = SDL_RWsize(rw);
++    if (size64 <= 0)
++    {
++        SDL_RWclose(rw);
++        return nullptr;
++    }
+ 
+-    auto *data = (unsigned char *)malloc(size);
++    auto *data = (unsigned char *)malloc((size_t)size64);
+     if (!data)
+     {
+-        fclose(file);
++        SDL_RWclose(rw);
+         return nullptr;
+     }
+ 
+-    if (fread(data, 1, size, file) != size)
++    if (SDL_RWread(rw, data, 1, (size_t)size64) != (size_t)size64)
+     {
+         free(data);
+-        fclose(file);
++        SDL_RWclose(rw);
+         return nullptr;
+     }
+ 
+-    fclose(file);
++    SDL_RWclose(rw);
++    *outSize = (size_t)size64;
+     return data;
+ }
+ 
+ int WriteDataToFile(const char *path, void *data, size_t size)
+ {
+-    FILE *f = fopen(path, "wb");
+-    if (!f)
++    SDL_RWops *rw = SDL_RWFromFile(path, "wb");
++    if (!rw)
+     {
+         return -1;
+     }
+ 
+-    if (fwrite(data, 1, size, f) != size)
++    if (SDL_RWwrite(rw, data, 1, size) != size)
+     {
+-        fclose(f);
++        SDL_RWclose(rw);
+         return -2;
+     }
+ 
+-    fclose(f);
++    SDL_RWclose(rw);
+     return 0;
+ }
+ } // namespace FileSystem
+@@ -185,18 +196,20 @@ class ConfigUI
+             int bit;
+         };
+ 
++        // UI 文案（已汉化）。这些都是原版 D3D 时代的图形选项，
++        // 在 SDL2 portable 分支里多数已无实际作用；真正有效的一般是画面模式与帧率。
+         const CheckboxSpec specs[11] = {
+-            {"No Vertex Buffer", GCOS_DONT_USE_VERTEX_BUF},
+-            {"No Fog", GCOS_DONT_USE_FOG},
+-            {"16 Bit Textures", GCOS_FORCE_16BIT_COLOR_MODE},
+-            {"Suppress use of gouraud shading", GCOS_SUPPRESS_USE_OF_GOROUD_SHADING},
+-            {"Don't apply color composition", GCOS_NO_COLOR_COMP},
+-            {"Start in reference rasterizer mode", GCOS_REFERENCE_RASTERIZER_MODE},
+-            {"Clear back buffer on refresh", GCOS_CLEAR_BACKBUFFER_ON_REFRESH},
+-            {"Display minimum graphics needed", GCOS_DISPLAY_MINIMUM_GRAPHICS},
+-            {"No Depth test", GCOS_TURN_OFF_DEPTH_TEST},
+-            {"Force 60 FPS", GCOS_FORCE_60FPS},
+-            {"No DirectInput pad", GCOS_NO_DIRECTINPUT_PAD},
++            {"禁用顶点缓冲", GCOS_DONT_USE_VERTEX_BUF},
++            {"禁用雾效", GCOS_DONT_USE_FOG},
++            {"16 位纹理", GCOS_FORCE_16BIT_COLOR_MODE},
++            {"禁用高洛德着色", GCOS_SUPPRESS_USE_OF_GOROUD_SHADING},
++            {"禁用颜色合成", GCOS_NO_COLOR_COMP},
++            {"参考光栅器模式启动", GCOS_REFERENCE_RASTERIZER_MODE},
++            {"刷新时清除后台缓冲", GCOS_CLEAR_BACKBUFFER_ON_REFRESH},
++            {"最低画质显示", GCOS_DISPLAY_MINIMUM_GRAPHICS},
++            {"禁用深度测试", GCOS_TURN_OFF_DEPTH_TEST},
++            {"强制 60 FPS", GCOS_FORCE_60FPS},
++            {"禁用 DirectInput 手柄", GCOS_NO_DIRECTINPUT_PAD},
+         };
+ 
+         const int checkboxCount = sizeof(specs) / sizeof(specs[0]);
+@@ -223,9 +236,11 @@ class ConfigUI
+             int initialIndex;
+         };
+ 
+-        const RadioGroupSpec radioGroup[]{{"Screen Mode", {"Fullscreen", "Windowed"}, 130, 0, cfg.windowed},
+-                                          {"Refresh Rate", {"1/1", "1/2", "1/3"}, 70, 1, cfg.frameskipConfig},
+-                                          {"Colors", {"32-bit", "16-bit"}, 120, 2, cfg.colorMode16bit}};
++        // 1/1 1/2 1/3 保留数字形式：Supervisor.hpp 注释写的是 0=fullspeed/1=1/2/2=1/4，
++        // 与这里显示的 "1/3" 对不上，不擅自改写其语义。
++        const RadioGroupSpec radioGroup[]{{"画面模式", {"全屏", "窗口"}, 130, 0, cfg.windowed},
++                                          {"帧率", {"1/1", "1/2", "1/3"}, 70, 1, cfg.frameskipConfig},
++                                          {"色彩位数", {"32 位色", "16 位色"}, 120, 2, cfg.colorMode16bit}};
+ 
+         int totalRadioButtons = 0;
+         for (const auto &group : radioGroup)
+@@ -278,9 +293,9 @@ class ConfigUI
+ 
+         bottomButtons.reserve(2);
+ 
+-        bottomButtons.emplace_back(SDL_Rect{cancelX, top, buttonWidth, buttonHeight}, "Cancel", [&] { requestQuit(); });
++        bottomButtons.emplace_back(SDL_Rect{cancelX, top, buttonWidth, buttonHeight}, "取消", [&] { requestQuit(); });
+ 
+-        bottomButtons.emplace_back(SDL_Rect{saveX, top, buttonWidth, buttonHeight}, "Save", [&] {
++        bottomButtons.emplace_back(SDL_Rect{saveX, top, buttonWidth, buttonHeight}, "保存", [&] {
+             if (saveConfig())
+             {
+                 shouldExit = true;
+@@ -344,26 +359,29 @@ class ConfigUI
+         applyUiToConfig();
+         if (FileSystem::WriteDataToFile(configPath, &cfg, sizeof(GameConfiguration)) != 0)
+         {
+-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Failed", "Could not write configuration file.",
+-                                     window);
++            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "保存失败", "无法写入配置文件。\n（東方紅魔郷.cfg）", window);
+             return false;
+         }
+         hasUnsavedChanges = false;
+-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Save Successful", "Configuration saved successfully.",
+-                                 window);
++        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "保存成功", "配置已保存。", window);
+         printf("Saved config to %s\n", configPath);
+         return true;
+     }
+ };
+ 
+-int main()
++// 必须用带参数的签名：SDL 会把 main 宏替换为 SDL_main，
++// 而 SDL_main.h 声明的原型是 C 链接的 SDL_main(int, char **)，签名不一致会冲突。
++int main(int argc, char *argv[])
+ {
+     const char *configPath = "東方紅魔郷.cfg";
+ 
+     GameConfiguration cfg;
+-    if (const auto data = FileSystem::OpenPath(configPath))
++    size_t configFileSize = 0;
++    if (const auto data = FileSystem::OpenPath(configPath, &configFileSize))
+     {
+-        memcpy(&cfg, data, sizeof(GameConfiguration));
++        // 必须校验长度：原代码直接 memcpy(sizeof(GameConfiguration)) 而不看实际文件大小，
++        // 遇到被截断或损坏的配置文件会越界读。
++        memcpy(&cfg, data, configFileSize < sizeof(GameConfiguration) ? configFileSize : sizeof(GameConfiguration));
+         free(data);
+         cfg.windowed = std::min<u8>(cfg.windowed, 1);
+         cfg.frameskipConfig = std::min<u8>(cfg.frameskipConfig, 2);
+@@ -399,7 +417,7 @@ int main()
+     }
+ 
+     SDL_Window *window =
+-        SDL_CreateWindow("Touhou 6 Config", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 450, 600, SDL_WINDOW_SHOWN);
++        SDL_CreateWindow("東方紅魔郷 配置工具", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 450, 600, SDL_WINDOW_SHOWN);
+ 
+     if (!window)
+     {
+@@ -419,10 +437,41 @@ int main()
+         return 1;
+     }
+ 
+-    TTF_Font *font = TTF_OpenFont("NotoSans-Regular.ttf", 18);
++    // 字体候选链：优先中文字体，因为 UI 文案已汉化。
++    // 注意 msgothic.ttc 是**日文字体，不含简体中文字形**，命中它会整屏豆腐块(□)，
++    // 所以它只能作为最后的兜底。Win7+ 都自带微软雅黑，
++    // 相对路径失败时还有 C:\Windows\Fonts 绝对路径兜底。
++    // 注意本程序是 WindowedApp（无控制台），printf 用户看不见，致命错误必须弹 MessageBox。
++    const char *fontCandidates[] = {
++        "msyh.ttc",
++        "C:\\Windows\\Fonts\\msyh.ttc",
++        "simhei.ttf",
++        "C:\\Windows\\Fonts\\simhei.ttf",
++        "NotoSansSC-Regular.ttf",
++        TH_FALLBACK_FONT_FILENAME,
++        TH_PRIMARY_FONT_FILENAME,
++    };
++
++    TTF_Font *font = NULL;
++    for (const char *candidate : fontCandidates)
++    {
++        font = TTF_OpenFont(candidate, 18);
++        if (font != NULL)
++        {
++            printf("Loaded font: %s\n", candidate);
++            break;
++        }
++        printf("Failed to load font %s: %s\n", candidate, TTF_GetError());
++    }
++
+     if (!font)
+     {
+-        printf("Failed to load font: %s\n", TTF_GetError());
++        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "缺少字体",
++                                 "找不到可用的字体文件。\n\n请在 th06_config.exe 旁边放一个字体：\n"
++                                 "  msyh.ttc（微软雅黑，推荐）\n"
++                                 "  simhei.ttf（黑体）\n"
++                                 "  NotoSansSC-Regular.ttf",
++                                 NULL);
+         SDL_DestroyRenderer(renderer);
+         SDL_DestroyWindow(window);
+         TTF_Quit();
+diff --git a/src/ItemManager.cpp b/src/ItemManager.cpp
+index 9ce9066..9736ac6 100644
+--- a/src/ItemManager.cpp
++++ b/src/ItemManager.cpp
+@@ -16,7 +16,7 @@ ItemManager::ItemManager() {
+ 
+ };
+ 
+-void ItemManager::SpawnItem(const ZunVec3 *position, ItemType itemType, i32 state)
++void ItemManager::SpawnItem(const ZunVec3 *position, ItemType itemType, i32 state, const ZunVec3 *targetPosition)
+ {
+     Item *item;
+     i32 idx;
+@@ -50,12 +50,36 @@ void ItemManager::SpawnItem(const ZunVec3 *position, ItemType itemType, i32 stat
+         item->itemType = itemType;
+         item->state = state;
+         item->timer.InitializeForPopup();
+-        if (state == 2)
++        if (state == 3)
+         {
+-            // From 48.0f to 336.0f
+-            item->targetPosition.x = g_Rng.GetRandomF32ZeroToOne() * 288.0f + 48.0f;
+-            // From -64.0 to 128.0f
+-            item->targetPosition.y = g_Rng.GetRandomF32ZeroToOne() * 192.0f - 64.0f;
++            // 自定义状态：匀速直线飞行，用来复刻子弹的运动。
++            // 注意此模式下 targetPosition 参数被复用为「速度矢量」（每帧位移）——
++            // Item 结构体里没有专门的 velocity 字段，而 startPosition 在每一帧
++            // 都被当作速度累加（见 OnUpdate），正好可以顶这个角色。
++            if (targetPosition != nullptr)
++            {
++                item->startPosition = *targetPosition;
++            }
++            else
++            {
++                item->startPosition.x = 0.0f;
++                item->startPosition.y = 0.0f;
++                item->startPosition.z = 0.0f;
++            }
++        }
++        else if (state == 2)
++        {
++            if (targetPosition != nullptr)
++            {
++                item->targetPosition = *targetPosition;
++            }
++            else
++            {
++                // From 48.0f to 336.0f
++                item->targetPosition.x = g_Rng.GetRandomF32ZeroToOne() * 288.0f + 48.0f;
++                // From -64.0 to 128.0f
++                item->targetPosition.y = g_Rng.GetRandomF32ZeroToOne() * 192.0f - 64.0f;
++            }
+             item->targetPosition.z = 0.0;
+             item->startPosition = item->currentPosition;
+         }
+@@ -105,7 +129,29 @@ void ItemManager::OnUpdate()
+             continue;
+         }
+         this->itemCount++;
+-        if (curItem->state == 2)
++        if (curItem->state == 3)
++        {
++            // 自定义：匀速直线飞行，运动完全由 SpawnItem 写入的速度矢量决定。
++            // 必须在这里就 goto yolo —— 否则会落到第 153 行被施加重力
++            // （startPosition.y 每帧 +0.03 并 clamp 到 3.0），直线弹道会变成抛物线。
++            curItem->currentPosition += curItem->startPosition * g_Supervisor.effectiveFramerateMultiplier;
++
++            // 子弹会朝各个方向飞，所以四个方向都要回收；
++            // 只用下面原有的「只查底部」判定，横飞的道具会永远留在画面外不释放，最终撑爆道具池。
++            const f32 margin = 32.0f;
++            if (curItem->currentPosition.y > (f32)GAME_REGION_BOTTOM + margin ||
++                curItem->currentPosition.y < (f32)GAME_REGION_TOP - margin ||
++                curItem->currentPosition.x < (f32)GAME_REGION_LEFT - margin ||
++                curItem->currentPosition.x > (f32)GAME_REGION_RIGHT + margin)
++            {
++                curItem->isInUse = 0;
++                g_GameManager.DecreaseSubrank(3);
++                continue;
++            }
++
++            goto yolo;
++        }
++        else if (curItem->state == 2)
+         {
+             if ((i32)(60 > curItem->timer.current))
+             {
+diff --git a/src/ItemManager.hpp b/src/ItemManager.hpp
+index 2812a68..6cd3ede 100644
+--- a/src/ItemManager.hpp
++++ b/src/ItemManager.hpp
+@@ -34,7 +34,8 @@ struct Item
+ struct ItemManager
+ {
+     ItemManager();
+-    void SpawnItem(const ZunVec3 *position, ItemType type, i32 state);
++    // targetPosition 仅在 state == 2 时生效；传 nullptr 则沿用原版的随机散开位置。
++    void SpawnItem(const ZunVec3 *position, ItemType type, i32 state, const ZunVec3 *targetPosition = nullptr);
+     void OnUpdate();
+     void OnDraw();
+     void RemoveAllItems();
+diff --git a/src/ZunMath.hpp b/src/ZunMath.hpp
+index 6d45152..383ad8f 100644
+--- a/src/ZunMath.hpp
++++ b/src/ZunMath.hpp
+@@ -5,6 +5,12 @@
+ #include <cmath>
+ #include <cstring>
+ 
++// MinGW 的 winnt.h 里有 "#define RotateLeft16 _rotl16"，会把下面同名的辅助函数
++// 定义替换掉（报 redeclared inline）。这里先清掉该宏。
++#ifdef RotateLeft16
++#undef RotateLeft16
++#endif
++
+ #ifndef __has_builtin
+ #define __has_builtin(name) 0
+ #endif
+diff --git a/src/midi/MidiWin32.hpp b/src/midi/MidiWin32.hpp
+index 33fc617..eb1635a 100644
+--- a/src/midi/MidiWin32.hpp
++++ b/src/midi/MidiWin32.hpp
+@@ -2,8 +2,9 @@
+ 
+ #include "ZunResult.hpp"
+ #include "inttypes.hpp"
+-#include <mmsystem.h>
++// MinGW 下 mmsystem.h 依赖 windows.h 先备好基础类型，两者顺序不能颠倒。
+ #include <windows.h>
++#include <mmsystem.h>
+ 
+ struct MidiDevice
+ {
